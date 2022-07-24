@@ -30,27 +30,32 @@ import java.util.Spliterator;
 import java.util.Spliterators;
 import java.util.function.BiPredicate;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
 
+import sun.misc.Unsafe;
+
 public class UnionFileSystem extends FileSystem {
+    private static final boolean USE_UNSAFE = Boolean.parseBoolean(System.getProperty("securejarhandler.useUnsafeAccessor", "true"));
     private static final MethodHandle ZIPFS_EXISTS;
     static final String SEP_STRING = "/";
 
     static {
         try {
-            var hackfield = MethodHandles.Lookup.class.getDeclaredField("IMPL_LOOKUP");
-            hackfield.setAccessible(true);
-            MethodHandles.Lookup hack = (MethodHandles.Lookup) hackfield.get(null);
+            Supplier<MethodHandles.Lookup> supplier =
+                USE_UNSAFE ? new UnsafeProvider() : new ReflectionProvider();
+            MethodHandles.Lookup hack = supplier.get();
 
             var clz = Class.forName("jdk.nio.zipfs.ZipPath");
             ZIPFS_EXISTS = hack.findSpecial(clz, "exists", MethodType.methodType(boolean.class), clz);
-        } catch (NoSuchFieldException | IllegalAccessException | ClassNotFoundException | NoSuchMethodException e) {
+        } catch (IllegalAccessException | ClassNotFoundException | NoSuchMethodException e) {
             throw new RuntimeException(e);
         }
     }
+
     private static class NoSuchFileException extends java.nio.file.NoSuchFileException {
         public NoSuchFileException(final String file) {
             super(file);
@@ -375,5 +380,71 @@ public class UnionFileSystem extends FileSystem {
         if (sBasePath.length() > 1 && sBasePath.startsWith("/"))
             sBasePath = sBasePath.substring(1);
         return pathFilter.test(sPath, sBasePath);
+    }
+
+    private static class ReflectionProvider implements Supplier<MethodHandles.Lookup> {
+        private static final MethodHandles.Lookup LOOKUP;
+
+        static {
+            final var moduleLayer = ModuleLayer.boot();
+            final var myModule = moduleLayer.findModule("cpw.mods.securejarhandler");
+            if (myModule.isPresent()) {
+                final var gj9h = myModule.get();
+                moduleLayer
+                    .findModule("java.base")
+                    .filter(m-> m.isOpen("java.lang.invoke", gj9h))
+                    .orElseThrow(()->new IllegalStateException("""
+                    Missing JVM arguments. Please correct your runtime profile and run again.
+                        --add-opens java.base/java.lang.invoke=cpw.mods.securejarhandler"""));
+            } else if (Boolean.parseBoolean(System.getProperty("securejarhandler.throwOnMissingModule", "true"))) {
+                // Hack for JMH benchmark: in JMH, SecureJarHandler does not load as a module, but we add-open to all unnamed in the jvm args
+                throw new RuntimeException("Failed to find securejarhandler module!");
+            }
+
+            try {
+                var hackfield = MethodHandles.Lookup.class.getDeclaredField("IMPL_LOOKUP");
+                hackfield.setAccessible(true);
+                LOOKUP = (MethodHandles.Lookup) hackfield.get(null);
+            } catch (NoSuchFieldException | IllegalAccessException e) {
+                throw new IllegalStateException(e);
+            }
+        }
+
+        @Override
+        public MethodHandles.Lookup get() {
+            return LOOKUP;
+        }
+    }
+
+    private static class UnsafeProvider implements Supplier<MethodHandles.Lookup> {
+        private static final MethodHandles.Lookup LOOKUP;
+
+        static {
+            try {
+                var f = Unsafe.class.getDeclaredField("theUnsafe");
+                f.setAccessible(true);
+                Unsafe unsafe = (Unsafe)f.get(null);
+
+                long offset = getStaticOffset(unsafe, MethodHandles.Lookup.class, "IMPL_LOOKUP");
+                LOOKUP = (MethodHandles.Lookup) unsafe.getObject(MethodHandles.Lookup.class, offset);
+            } catch (Exception e) {
+                throw new RuntimeException("Unable to get Unsafe reference, this should never be possible," +
+                    " be sure to report this will exact details on what JVM you're running.", e);
+            }
+        }
+
+        private static long getStaticOffset(Unsafe unsafe, Class<?> clz, String name) {
+            try {
+                return unsafe.staticFieldOffset(clz.getDeclaredField(name));
+            } catch (Exception e) {
+                throw new RuntimeException("Unable to get index for " + clz.getName() + "." + name + ", " +
+                    " be sure to report this will exact details on what JVM you're running.", e);
+            }
+        }
+
+        @Override
+        public MethodHandles.Lookup get() {
+            return LOOKUP;
+        }
     }
 }
